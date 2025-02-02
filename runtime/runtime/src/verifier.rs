@@ -5,6 +5,7 @@ use near_crypto::key_conversion::is_valid_staking_key;
 use near_parameters::RuntimeConfig;
 use near_primitives::account::AccessKeyPermission;
 use near_primitives::action::delegate::SignedDelegateAction;
+use near_primitives::action::DeployGlobalContractAction;
 use near_primitives::checked_feature;
 use near_primitives::errors::{
     ActionsValidationError, InvalidAccessKeyError, InvalidTxError, ReceiptValidationError,
@@ -44,12 +45,7 @@ pub fn check_storage_stake(
     runtime_config: &RuntimeConfig,
     current_protocol_version: ProtocolVersion,
 ) -> Result<(), StorageStakingError> {
-    #[cfg(not(feature = "protocol_feature_nonrefundable_transfer_nep491"))]
     let billable_storage_bytes = account.storage_usage();
-    #[cfg(feature = "protocol_feature_nonrefundable_transfer_nep491")]
-    let billable_storage_bytes =
-        account.storage_usage().saturating_sub(account.permanent_storage_bytes());
-
     let required_amount = Balance::from(billable_storage_bytes)
         .checked_mul(runtime_config.storage_amount_per_byte())
         .ok_or_else(|| {
@@ -320,6 +316,7 @@ pub(crate) fn validate_receipt(
         ReceiptEnum::Data(data_receipt) | ReceiptEnum::PromiseResume(data_receipt) => {
             validate_data_receipt(limit_config, data_receipt)
         }
+        ReceiptEnum::GlobalContractDistribution(_) => Ok(()), // Distribution receipt can't be issued without a valid contract
     }
 }
 
@@ -433,12 +430,14 @@ pub fn validate_action(
     match action {
         Action::CreateAccount(_) => Ok(()),
         Action::DeployContract(a) => validate_deploy_contract_action(limit_config, a),
+        Action::DeployGlobalContract(a) => {
+            validate_deploy_global_contract_action(limit_config, a, current_protocol_version)
+        }
+        Action::UseGlobalContract(_) => {
+            validate_use_global_contract_action(current_protocol_version)
+        }
         Action::FunctionCall(a) => validate_function_call_action(limit_config, a),
         Action::Transfer(_) => Ok(()),
-        #[cfg(feature = "protocol_feature_nonrefundable_transfer_nep491")]
-        Action::NonrefundableStorageTransfer(_) => {
-            check_feature_enabled(ProtocolFeature::NonrefundableStorage, current_protocol_version)
-        }
         Action::Stake(a) => validate_stake_action(a),
         Action::AddKey(a) => validate_add_key_action(limit_config, a),
         Action::DeleteKey(_) => Ok(()),
@@ -470,6 +469,31 @@ fn validate_deploy_contract_action(
     }
 
     Ok(())
+}
+
+/// Validates `DeployGlobalContractAction`. Checks that the given contract size doesn't exceed the limit.
+fn validate_deploy_global_contract_action(
+    limit_config: &LimitConfig,
+    action: &DeployGlobalContractAction,
+    current_protocol_version: ProtocolVersion,
+) -> Result<(), ActionsValidationError> {
+    check_global_contracts_enabled(current_protocol_version)?;
+
+    if action.code.len() as u64 > limit_config.max_contract_size {
+        return Err(ActionsValidationError::ContractSizeExceeded {
+            size: action.code.len() as u64,
+            limit: limit_config.max_contract_size,
+        });
+    }
+
+    Ok(())
+}
+
+/// Validates `UseGlobalContractAction`.
+fn validate_use_global_contract_action(
+    current_protocol_version: ProtocolVersion,
+) -> Result<(), ActionsValidationError> {
+    check_global_contracts_enabled(current_protocol_version)
 }
 
 /// Validates `FunctionCallAction`. Checks that the method name length doesn't exceed the limit and
@@ -568,21 +592,6 @@ fn validate_delete_action(action: &DeleteAccountAction) -> Result<(), ActionsVal
     Ok(())
 }
 
-#[cfg(feature = "protocol_feature_nonrefundable_transfer_nep491")]
-fn check_feature_enabled(
-    feature: ProtocolFeature,
-    current_protocol_version: ProtocolVersion,
-) -> Result<(), ActionsValidationError> {
-    if feature.protocol_version() <= current_protocol_version {
-        Ok(())
-    } else {
-        Err(ActionsValidationError::UnsupportedProtocolFeature {
-            protocol_feature: format!("{feature:?}"),
-            version: feature.protocol_version(),
-        })
-    }
-}
-
 fn truncate_string(s: &str, limit: usize) -> String {
     for i in (0..=limit).rev() {
         if let Some(s) = s.get(..i) {
@@ -590,6 +599,18 @@ fn truncate_string(s: &str, limit: usize) -> String {
         }
     }
     unreachable!()
+}
+
+fn check_global_contracts_enabled(
+    current_protocol_version: ProtocolVersion,
+) -> Result<(), ActionsValidationError> {
+    if !checked_feature!("stable", GlobalContracts, current_protocol_version) {
+        return Err(ActionsValidationError::UnsupportedProtocolFeature {
+            protocol_feature: "GlobalContracts".to_owned(),
+            version: current_protocol_version,
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -752,6 +773,31 @@ mod tests {
         }
     }
 
+    pub fn validate_verify_and_charge_transaction(
+        config: &RuntimeConfig,
+        state_update: &mut TrieUpdate,
+        signed_transaction: &SignedTransaction,
+        gas_price: Balance,
+        block_height: Option<BlockHeight>,
+        current_protocol_version: ProtocolVersion,
+    ) -> Result<VerificationResult, InvalidTxError> {
+        let transaction_cost = validate_transaction(
+            config,
+            gas_price,
+            signed_transaction,
+            true,
+            current_protocol_version,
+        )?;
+        verify_and_charge_transaction(
+            config,
+            state_update,
+            signed_transaction,
+            &transaction_cost,
+            block_height,
+            current_protocol_version,
+        )
+    }
+
     mod zero_balance_account_tests {
         use crate::near_primitives::account::id::AccountId;
         use crate::near_primitives::account::{
@@ -867,13 +913,11 @@ mod tests {
             CryptoHash::default(),
         );
 
-        let cost = validate_transaction(&config, gas_price, &transaction, true, PROTOCOL_VERSION)
-            .expect("valid transaction");
-        let verification_result = verify_and_charge_transaction(
+        let verification_result = validate_verify_and_charge_transaction(
             &config,
             &mut state_update,
             &transaction,
-            &cost,
+            gas_price,
             None,
             PROTOCOL_VERSION,
         )
@@ -941,17 +985,11 @@ mod tests {
             CryptoHash::default(),
         );
 
-        let maybe_cost =
-            validate_transaction(&config, gas_price, &transaction, false, PROTOCOL_VERSION);
-        // Validation might pass if it doesn't require the access key check at this stage
-        let cost =
-            maybe_cost.expect("expected validation to succeed (no access key check at this stage)");
-
-        let err = verify_and_charge_transaction(
+        let err = validate_verify_and_charge_transaction(
             &config,
             &mut state_update,
             &transaction,
-            &cost,
+            gas_price,
             None,
             PROTOCOL_VERSION,
         )
@@ -1014,13 +1052,11 @@ mod tests {
             CryptoHash::default(),
         );
 
-        let cost = validate_transaction(&config, gas_price, &transaction, true, PROTOCOL_VERSION)
-            .expect("expected no validation error");
-        let err = verify_and_charge_transaction(
+        let err = validate_verify_and_charge_transaction(
             &config,
             &mut state_update,
             &transaction,
-            &cost,
+            gas_price,
             None,
             PROTOCOL_VERSION,
         )
@@ -1046,13 +1082,11 @@ mod tests {
             CryptoHash::default(),
         );
 
-        let cost = validate_transaction(&config, gas_price, &transaction, true, PROTOCOL_VERSION)
-            .expect("expected no validation error");
-        let err = verify_and_charge_transaction(
+        let err = validate_verify_and_charge_transaction(
             &config,
             &mut state_update,
             &transaction,
-            &cost,
+            gas_price,
             None,
             PROTOCOL_VERSION,
         )
@@ -1120,13 +1154,11 @@ mod tests {
             CryptoHash::default(),
         );
 
-        let cost = validate_transaction(&config, gas_price, &transaction, true, PROTOCOL_VERSION)
-            .expect("expected cost from validation");
-        let err = verify_and_charge_transaction(
+        let err = validate_verify_and_charge_transaction(
             &config,
             &mut state_update,
             &transaction,
-            &cost,
+            gas_price,
             None,
             PROTOCOL_VERSION,
         )
@@ -1171,13 +1203,11 @@ mod tests {
             0,
         );
 
-        let cost = validate_transaction(&config, gas_price, &transaction, true, PROTOCOL_VERSION)
-            .expect("expected cost from validation");
-        let err = verify_and_charge_transaction(
+        let err = validate_verify_and_charge_transaction(
             &config,
             &mut state_update,
             &transaction,
-            &cost,
+            gas_price,
             None,
             PROTOCOL_VERSION,
         )
@@ -1217,13 +1247,11 @@ mod tests {
             CryptoHash::default(),
         );
 
-        let cost = validate_transaction(&config, gas_price, &transaction, true, PROTOCOL_VERSION)
-            .expect("expected cost from validation");
-        let verification_result = verify_and_charge_transaction(
+        let verification_result = validate_verify_and_charge_transaction(
             &config,
             &mut state_update,
             &transaction,
-            &cost,
+            gas_price,
             None,
             PROTOCOL_VERSION,
         )
@@ -1260,13 +1288,11 @@ mod tests {
             CryptoHash::default(),
         );
 
-        let cost = validate_transaction(&config, gas_price, &transaction, true, PROTOCOL_VERSION)
-            .expect("expected cost from validation");
-        let res = verify_and_charge_transaction(
+        let err = validate_verify_and_charge_transaction(
             &config,
             &mut state_update,
             &transaction,
-            &cost,
+            gas_price,
             None,
             PROTOCOL_VERSION,
         )
@@ -1274,7 +1300,7 @@ mod tests {
         let account = get_account(&state_update, &account_id).unwrap().unwrap();
 
         assert_eq!(
-            res,
+            err,
             InvalidTxError::LackBalanceForState {
                 signer_id: account_id,
                 amount: Balance::from(account.storage_usage()) * config.storage_amount_per_byte()
@@ -1317,13 +1343,11 @@ mod tests {
             CryptoHash::default(),
             0,
         );
-        let cost = validate_transaction(&config, gas_price, &transaction, true, PROTOCOL_VERSION)
-            .expect("expected no validation error");
-        verify_and_charge_transaction(
+        validate_verify_and_charge_transaction(
             &config,
             &mut state_update,
             &transaction,
-            &cost,
+            gas_price,
             None,
             PROTOCOL_VERSION,
         )
@@ -1339,13 +1363,11 @@ mod tests {
             CryptoHash::default(),
             0,
         );
-        let cost = validate_transaction(&config, gas_price, &transaction, true, PROTOCOL_VERSION)
-            .expect("expected no validation error");
-        verify_and_charge_transaction(
+        validate_verify_and_charge_transaction(
             &config,
             &mut state_update,
             &transaction,
-            &cost,
+            gas_price,
             None,
             PROTOCOL_VERSION,
         )
@@ -1361,13 +1383,11 @@ mod tests {
             CryptoHash::default(),
             0,
         );
-        let cost = validate_transaction(&config, gas_price, &transaction, true, PROTOCOL_VERSION)
-            .expect("expected no validation error");
-        verify_and_charge_transaction(
+        validate_verify_and_charge_transaction(
             &config,
             &mut state_update,
             &transaction,
-            &cost,
+            gas_price,
             None,
             PROTOCOL_VERSION,
         )
@@ -1405,13 +1425,11 @@ mod tests {
             0,
         );
 
-        let cost = validate_transaction(&config, gas_price, &transaction, true, PROTOCOL_VERSION)
-            .expect("expected no validation error");
-        let err = verify_and_charge_transaction(
+        let err = validate_verify_and_charge_transaction(
             &config,
             &mut state_update,
             &transaction,
-            &cost,
+            gas_price,
             None,
             PROTOCOL_VERSION,
         )
@@ -1456,13 +1474,11 @@ mod tests {
             0,
         );
 
-        let cost = validate_transaction(&config, gas_price, &transaction, true, PROTOCOL_VERSION)
-            .expect("expected no validation error");
-        let err = verify_and_charge_transaction(
+        let err = validate_verify_and_charge_transaction(
             &config,
             &mut state_update,
             &transaction,
-            &cost,
+            gas_price,
             None,
             PROTOCOL_VERSION,
         )
@@ -1506,13 +1522,11 @@ mod tests {
             0,
         );
 
-        let cost = validate_transaction(&config, gas_price, &transaction, true, PROTOCOL_VERSION)
-            .expect("expected no validation error");
-        let err = verify_and_charge_transaction(
+        let err = validate_verify_and_charge_transaction(
             &config,
             &mut state_update,
             &transaction,
-            &cost,
+            gas_price,
             None,
             PROTOCOL_VERSION,
         )
@@ -1561,13 +1575,11 @@ mod tests {
             wasm_config.limit_config.max_transaction_size = transaction_size + 1;
         }
 
-        let cost = validate_transaction(&config, gas_price, &transaction, false, PROTOCOL_VERSION)
-            .expect("expected no validation error");
-        verify_and_charge_transaction(
+        validate_verify_and_charge_transaction(
             &config,
             &mut state_update,
             &transaction,
-            &cost,
+            gas_price,
             None,
             PROTOCOL_VERSION,
         )
@@ -1991,6 +2003,7 @@ mod tests {
         check("hello", 5, "hello");
         check("hello", 6, "hello");
         check("hello", 10, "hello");
+        // cspell:ignore привет
         check("привет", 3, "п");
     }
 }
